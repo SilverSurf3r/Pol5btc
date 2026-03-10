@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Polymarket BTC 5m Bot</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; background: #0e1117; color: #e6edf3; }
+    .wrap { max-width: 1100px; margin: 20px auto; padding: 0 16px; }
+    .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 14px; }
+    .big { font-size: 26px; font-weight: bold; }
+    .row { display: flex; gap: 8px; margin: 12px 0; flex-wrap: wrap; }
+    button { background: #238636; border: none; color: white; padding: 10px 14px; border-radius: 8px; cursor: pointer; }
+    button.secondary { background: #1f6feb; }
+    #log { max-height: 280px; overflow: auto; font-size: 12px; white-space: pre-wrap; }
+    .buy { color: #3fb950; font-weight: bold; }
+    .sell { color: #f85149; font-weight: bold; }
+    .warn { color: #ffa657; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🤖 Polymarket BTC Mean Reversion (5m)</h1>
+  <p>Стратегия: торговля отклонением от средней (Z-score) на рынке прогноза цены BTC.</p>
+
+  <div class="row">
+    <button id="wcBtn" class="secondary">🔐 Login via WalletConnect</button>
+    <span id="wallet">Кошелек: не подключен</span>
+    <button onclick="switchMode('paper')">Эмуляция</button>
+    <button onclick="switchMode('real')">Реальный режим</button>
+  </div>
+
+  <div class="grid">
+    <div class="card"><div>Цена</div><div id="price" class="big">-</div></div>
+    <div class="card"><div>MA</div><div id="ma" class="big">-</div></div>
+    <div class="card"><div>Z-score</div><div id="z" class="big">-</div></div>
+    <div class="card"><div>Сигнал</div><div id="signal" class="big">HOLD</div></div>
+    <div class="card"><div>Режим</div><div id="mode" class="big">paper</div></div>
+    <div class="card"><div>Позиция (qty)</div><div id="qty" class="big">0</div></div>
+    <div class="card"><div>Unrealized PnL</div><div id="upnl" class="big">0</div></div>
+    <div class="card"><div>Realized PnL</div><div id="rpnl" class="big">0</div></div>
+  </div>
+
+  <h3>Лента событий</h3>
+  <div id="log" class="card"></div>
+</div>
+
+<script src="https://unpkg.com/@walletconnect/ethereum-provider@2.17.0/dist/index.umd.js"></script>
+<script>
+  let ws;
+  let provider;
+
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+  function beep(freq, duration = 0.12, type = 'sine') {
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.15, audioCtx.currentTime + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + duration);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + duration);
+  }
+
+  function appendLog(line, cls = '') {
+    const el = document.getElementById('log');
+    const div = document.createElement('div');
+    if (cls) div.className = cls;
+    div.textContent = `[${new Date().toLocaleTimeString()}] ${line}`;
+    el.prepend(div);
+  }
+
+  function applyState(s) {
+    document.getElementById('price').textContent = s.last_price;
+    document.getElementById('ma').textContent = s.moving_avg;
+    document.getElementById('z').textContent = s.zscore;
+    document.getElementById('signal').textContent = s.signal;
+    document.getElementById('mode').textContent = s.mode;
+    document.getElementById('qty').textContent = s.position_qty;
+    document.getElementById('upnl').textContent = s.unrealized_pnl;
+    document.getElementById('rpnl').textContent = s.realized_pnl;
+  }
+
+  async function loadState() {
+    const r = await fetch('/api/state');
+    applyState(await r.json());
+  }
+
+  async function switchMode(mode) {
+    const r = await fetch(`/api/mode/${mode}`, { method: 'POST' });
+    appendLog(`Переключение режима: ${JSON.stringify(await r.json())}`);
+  }
+
+  async function connectWallet() {
+    try {
+      const projectId = window.localStorage.getItem('walletconnect_project_id') || 'demo';
+      provider = await window.EthereumProvider.init({ projectId, chains: [1], showQrModal: true });
+      const accounts = await provider.request({ method: 'eth_requestAccounts' });
+      document.getElementById('wallet').textContent = `Кошелек: ${accounts[0]}`;
+      appendLog(`WalletConnect login OK: ${accounts[0]}`);
+    } catch (e) {
+      appendLog(`WalletConnect ошибка: ${e.message}`, 'warn');
+      appendLog('Подсказка: задайте WalletConnect Project ID в localStorage ключом walletconnect_project_id', 'warn');
+    }
+  }
+
+  document.getElementById('wcBtn').addEventListener('click', connectWallet);
+
+  function startWs() {
+    ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+    ws.onopen = () => appendLog('WebSocket подключен');
+    ws.onmessage = (evt) => {
+      const data = JSON.parse(evt.data);
+      applyState(data);
+      if (data.fill) {
+        if (data.fill.side === 'BUY') {
+          beep(880);
+          appendLog(`BUY qty=${data.fill.qty.toFixed(4)} @ ${data.fill.price}`, 'buy');
+        } else {
+          beep(440, 0.15, 'triangle');
+          appendLog(`SELL qty=${data.fill.qty.toFixed(4)} @ ${data.fill.price}`, 'sell');
+        }
+      }
+      if (data.last_error) appendLog(`Ошибка: ${data.last_error}`, 'warn');
+    };
+    ws.onclose = () => setTimeout(startWs, 2000);
+  }
+
+  loadState();
+  startWs();
+</script>
+</body>
+</html>
